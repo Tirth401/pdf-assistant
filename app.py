@@ -1,34 +1,32 @@
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
 
-import os
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 import json
-import uuid
 import logging
+import os
 import traceback
-import jwt as pyjwt
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
 import bcrypt as _bcrypt
-
-from sqlalchemy import create_engine, Column, String, Text, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
-
+import jwt as pyjwt
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from phi.assistant import Assistant
-from phi.storage.assistant.postgres import PgAssistantStorage
-from phi.knowledge.pdf import PDFKnowledgeBase
-from phi.vectordb.pgvector import PgVector2
-from phi.llm.anthropic.claude import Claude
 from phi.embedder.sentence_transformer import SentenceTransformerEmbedder
+from phi.knowledge.pdf import PDFKnowledgeBase
+from phi.llm.anthropic.claude import Claude
+from phi.storage.assistant.postgres import PgAssistantStorage
+from phi.vectordb.pgvector import PgVector2
+from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,52 +61,64 @@ TOKEN_EXPIRY_DAYS = 30
 # ── SQLAlchemy setup for users & chat metadata ────────────
 Base = declarative_base()
 
+
 class UserRow(Base):
     __tablename__ = "app_users"
-    user_id    = Column(String, primary_key=True)
-    name       = Column(String, nullable=False)
-    email      = Column(String, unique=True, nullable=False)
-    password   = Column(String, nullable=False)
+    user_id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False)
+    password = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class ChatMetadataRow(Base):
     __tablename__ = "chat_metadata"
-    chat_id    = Column(String, primary_key=True)
-    user_id    = Column(String, nullable=False, index=True)
-    pdf_name   = Column(String, nullable=False)
-    pdf_path   = Column(String, nullable=False)
+    chat_id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False, index=True)
+    pdf_name = Column(String, nullable=False)
+    pdf_path = Column(String, nullable=False)
     collection = Column(String, nullable=False)
-    title      = Column(String, nullable=False)
+    title = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 _engine = create_engine(_sa_db_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=_engine)
 
+
 def hash_password(password: str) -> str:
     return _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
+
 
 def verify_password(password: str, hashed: str) -> bool:
     return _bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
 
+
 # ── Singleton embedder ────────────────────────────────────
 _embedder = None
+
+
 def get_embedder():
     global _embedder
     if _embedder is None:
         _embedder = SentenceTransformerEmbedder(dimensions=384)
     return _embedder
 
+
 def get_storage():
     return PgAssistantStorage(table_name="pdf_assistant_web", db_url=DB_URL)
+
 
 # ── DB-backed user helpers ────────────────────────────────
 def db_get_user_by_email(email: str):
     with SessionLocal() as s:
         return s.query(UserRow).filter(UserRow.email == email.lower().strip()).first()
 
+
 def db_get_user(user_id: str):
     with SessionLocal() as s:
         return s.query(UserRow).filter(UserRow.user_id == user_id).first()
+
 
 def db_create_user(user_id, name, email, password_hash):
     with SessionLocal() as s:
@@ -116,37 +126,63 @@ def db_create_user(user_id, name, email, password_hash):
         s.add(u)
         s.commit()
 
+
 # ── DB-backed metadata helpers ────────────────────────────
 def db_save_chat_meta(chat_id, user_id, pdf_name, pdf_path, collection, title):
     with SessionLocal() as s:
         row = ChatMetadataRow(
-            chat_id=chat_id, user_id=user_id, pdf_name=pdf_name,
-            pdf_path=pdf_path, collection=collection, title=title,
+            chat_id=chat_id,
+            user_id=user_id,
+            pdf_name=pdf_name,
+            pdf_path=pdf_path,
+            collection=collection,
+            title=title,
             created_at=datetime.utcnow(),
         )
         s.add(row)
         s.commit()
 
+
 def db_get_chat_meta(chat_id):
     with SessionLocal() as s:
         row = s.query(ChatMetadataRow).filter(ChatMetadataRow.chat_id == chat_id).first()
         if row:
-            return {"chat_id": row.chat_id, "user_id": row.user_id, "pdf_name": row.pdf_name,
-                    "pdf_path": row.pdf_path, "collection": row.collection, "title": row.title,
-                    "created_at": row.created_at.isoformat() if row.created_at else ""}
+            return {
+                "chat_id": row.chat_id,
+                "user_id": row.user_id,
+                "pdf_name": row.pdf_name,
+                "pdf_path": row.pdf_path,
+                "collection": row.collection,
+                "title": row.title,
+                "created_at": row.created_at.isoformat() if row.created_at else "",
+            }
         return None
+
 
 def db_list_chats(user_id):
     with SessionLocal() as s:
-        rows = s.query(ChatMetadataRow).filter(ChatMetadataRow.user_id == user_id)\
-                .order_by(ChatMetadataRow.created_at.desc()).all()
-        return [{"chat_id": r.chat_id, "pdf_name": r.pdf_name,
-                 "title": r.title, "created_at": r.created_at.isoformat() if r.created_at else ""} for r in rows]
+        rows = (
+            s.query(ChatMetadataRow)
+            .filter(ChatMetadataRow.user_id == user_id)
+            .order_by(ChatMetadataRow.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "chat_id": r.chat_id,
+                "pdf_name": r.pdf_name,
+                "title": r.title,
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in rows
+        ]
+
 
 def db_delete_chat(chat_id):
     with SessionLocal() as s:
         s.query(ChatMetadataRow).filter(ChatMetadataRow.chat_id == chat_id).delete()
         s.commit()
+
 
 def db_rename_chat(chat_id, new_title):
     with SessionLocal() as s:
@@ -155,10 +191,12 @@ def db_rename_chat(chat_id, new_title):
             row.title = new_title
             s.commit()
 
+
 # ── Auth helpers ──────────────────────────────────────────
 def create_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRY_DAYS)
+    expire = datetime.now(UTC) + timedelta(days=TOKEN_EXPIRY_DAYS)
     return pyjwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
 
 async def get_current_user(request: Request) -> dict:
     auth_header = request.headers.get("Authorization")
@@ -175,9 +213,10 @@ async def get_current_user(request: Request) -> dict:
             raise HTTPException(status_code=401, detail="User not found")
         return {"user_id": u.user_id, "name": u.name, "email": u.email}
     except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Token expired") from None
     except pyjwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token") from None
+
 
 # ── FastAPI app ──────────────────────────────────────────
 app = FastAPI(title="PDF Assistant")
@@ -191,6 +230,7 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 # ── Startup: create tables + pgvector extension ──────────
 @app.on_event("startup")
 async def startup_event():
@@ -198,6 +238,7 @@ async def startup_event():
     logger.info(f"DB_URL (sa):  {_sa_db_url[:40]}...")
     try:
         import psycopg
+
         raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
         with psycopg.connect(raw_url) as conn:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -213,13 +254,18 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Could not create app tables: {e}")
 
+
 # ── Health check ─────────────────────────────────────────
 @app.get("/api/health")
 async def health_check():
-    checks = {"status": "ok", "db_url_set": bool(os.getenv("DATABASE_URL")),
-              "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY"))}
+    checks = {
+        "status": "ok",
+        "db_url_set": bool(os.getenv("DATABASE_URL")),
+        "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+    }
     try:
         import psycopg
+
         raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
         with psycopg.connect(raw_url) as conn:
             conn.execute("SELECT 1")
@@ -231,16 +277,20 @@ async def health_check():
         checks["status"] = "degraded"
     return checks
 
+
 # ── Auth Routes ──────────────────────────────────────────
+
 
 class SignUpRequest(BaseModel):
     name: str
     email: str
     password: str
 
+
 class SignInRequest(BaseModel):
     email: str
     password: str
+
 
 @app.post("/api/auth/signup")
 async def signup(req: SignUpRequest):
@@ -257,6 +307,7 @@ async def signup(req: SignUpRequest):
     token = create_token(user_id)
     return {"token": token, "user": {"user_id": user_id, "name": req.name.strip(), "email": req.email.lower().strip()}}
 
+
 @app.post("/api/auth/signin")
 async def signin(req: SignInRequest):
     u = db_get_user_by_email(req.email)
@@ -267,18 +318,23 @@ async def signin(req: SignInRequest):
     token = create_token(u.user_id)
     return {"token": token, "user": {"user_id": u.user_id, "name": u.name, "email": u.email}}
 
+
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     return {"user": user}
 
+
 # ── App Routes ───────────────────────────────────────────
+
 
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
 
+
 class ChatRequest(BaseModel):
     message: str
+
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -321,10 +377,12 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(get_curr
         logger.error(f"Upload failed: {traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"detail": f"Upload processing error: {str(e)}"})
 
+
 @app.get("/api/chats")
 async def list_chats(user: dict = Depends(get_current_user)):
     chats = db_list_chats(user["user_id"])
     return {"chats": chats}
+
 
 @app.get("/api/chats/{chat_id}/messages")
 async def get_messages(chat_id: str, user: dict = Depends(get_current_user)):
@@ -344,6 +402,7 @@ async def get_messages(chat_id: str, user: dict = Depends(get_current_user)):
                     messages.append({"role": msg["role"], "content": msg["content"]})
             return {"messages": messages}
     return {"messages": []}
+
 
 @app.post("/api/chat/{chat_id}")
 async def chat(chat_id: str, request_body: ChatRequest, user: dict = Depends(get_current_user)):
@@ -384,6 +443,7 @@ async def chat(chat_id: str, request_body: ChatRequest, user: dict = Depends(get
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
+
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
     meta = db_get_chat_meta(chat_id)
@@ -399,6 +459,7 @@ async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
     db_delete_chat(chat_id)
     return {"status": "deleted"}
 
+
 @app.patch("/api/chats/{chat_id}")
 async def rename_chat(chat_id: str, body: dict, user: dict = Depends(get_current_user)):
     meta = db_get_chat_meta(chat_id)
@@ -410,8 +471,10 @@ async def rename_chat(chat_id: str, body: dict, user: dict = Depends(get_current
         db_rename_chat(chat_id, body["title"])
     return {"status": "ok"}
 
+
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", "8501"))
     uvicorn.run(app, host="0.0.0.0", port=port)

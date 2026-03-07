@@ -1,0 +1,86 @@
+name: CI – Lint & Test
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  lint:
+    name: Lint & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linting tools
+        run: |
+          pip install --upgrade pip
+          pip install ruff black isort
+
+      - name: Run Ruff (fast Python linter)
+        run: ruff check . --output-format=github
+
+      - name: Check Black formatting
+        run: black --check --diff .
+
+      - name: Check import sorting (isort)
+        run: isort --check-only --diff .
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies + mypy
+        run: |
+          pip install --upgrade pip
+          pip install mypy types-requests
+          pip install -r requirements.txt
+
+      - name: Run mypy (type check)
+        run: mypy app.py --ignore-missing-imports --no-strict-optional
+        continue-on-error: true  # advisory for now, won't block PRs
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install bandit safety
+
+      - name: Run Bandit (security linter)
+        run: bandit -r app.py -ll --format json || true
+
+      - name: Check for known vulnerabilities
+        run: pip install -r requirements.txt && safety check || true
+        continue-on-error: true
