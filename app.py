@@ -82,7 +82,7 @@ class ChatMetadataRow(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-_engine = create_engine(_sa_db_url, pool_pre_ping=True)
+_engine = create_engine(_sa_db_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 SessionLocal = sessionmaker(bind=_engine)
 
 
@@ -240,7 +240,7 @@ async def startup_event():
         import psycopg
 
         raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
-        with psycopg.connect(raw_url) as conn:
+        with psycopg.connect(raw_url, connect_timeout=10) as conn:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             conn.commit()
             logger.info("pgvector extension ready")
@@ -262,12 +262,13 @@ async def health_check():
         "status": "ok",
         "db_url_set": bool(os.getenv("DATABASE_URL")),
         "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "db_url_preview": DB_URL[:50] + "...",
     }
     try:
         import psycopg
 
         raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
-        with psycopg.connect(raw_url) as conn:
+        with psycopg.connect(raw_url, connect_timeout=5) as conn:
             conn.execute("SELECT 1")
             checks["db_connection"] = "ok"
             result = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'vector'").fetchone()
