@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- Three.js background canvas -->
+  <canvas id="bg-canvas"></canvas>
+
+  <!-- ═══════════════════════════════════════════════════════
+       Landing Page (shown when NOT authenticated)
+       ═══════════════════════════════════════════════════════ -->
+  <div id="page-landing" class="page">
+    <!-- Gradient orbs -->
+    <div class="bg-decor" aria-hidden="true">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+      <div class="orb orb-4"></div>
+    </div>
+
+    <nav class="landing-nav">
+      <div class="logo">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="16" y1="13" x2="8" y2="13"/>
+          <line x1="16" y1="17" x2="8" y2="17"/>
+          <polyline points="10 9 9 9 8 9"/>
+        </svg>
+        <span>PDF Assistant</span>
+      </div>
+      <div class="nav-actions">
+        <button id="nav-signin" class="btn-ghost">Sign In</button>
+        <button id="nav-signup" class="btn-primary">Get Started</button>
+      </div>
+    </nav>
+
+    <section class="hero">
+      <div class="hero-badge radiant-wrapper" style="--border-size:1.5px">
+        <div class="radiant-border"></div>
+        <span>&#10024; Powered by Claude AI</span>
+      </div>
+      <h1>Your Intelligent<br><span class="gradient-text">PDF Assistant</span></h1>
+      <p class="hero-subtitle">Upload any PDF document and have smart conversations about its content.<br>Get instant answers, summaries, and insights powered by advanced AI.</p>
+      <div class="hero-cta">
+        <button id="hero-signup" class="btn-primary btn-lg">Get Started Free &rarr;</button>
+        <button id="hero-signin" class="btn-ghost btn-lg">Sign In</button>
+      </div>
+    </section>
+
+    <section class="features">
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <h3>Upload PDFs</h3>
+        <p>Drag and drop any PDF document. We process and index it for intelligent search.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </div>
+        <h3>Ask Questions</h3>
+        <p>Chat naturally about your document. Get accurate answers with full context.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+          </svg>
+        </div>
+        <h3>Smart Context</h3>
+        <p>Each chat remembers your conversation history and the relevant PDF content.</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════
+       Auth Modal Overlay
+       ═══════════════════════════════════════════════════════ -->
+  <div id="auth-overlay" class="auth-overlay">
+    <div class="auth-card radiant-wrapper" style="--border-size:2px">
+      <div class="radiant-border"></div>
+      <button id="auth-close" class="auth-close" title="Close">&times;</button>
+
+      <!-- Sign In Form -->
+      <div id="form-signin" class="auth-form">
+        <h2>Welcome back</h2>
+        <p class="auth-desc">Sign in to continue</p>
+        <div id="signin-error" class="auth-error"></div>
+        <form id="signin-form">
+          <label>Email</label>
+          <input type="email" id="signin-email" placeholder="you@example.com" required />
+          <label>Password</label>
+          <input type="password" id="signin-password" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" required />
+          <button type="submit" class="btn-primary btn-full" id="signin-submit">Sign In</button>
+        </form>
+        <p class="auth-switch">Don't have an account? <a href="#" id="switch-to-signup">Sign Up</a></p>
+      </div>
+
+      <!-- Sign Up Form -->
+      <div id="form-signup" class="auth-form" style="display:none">
+        <h2>Create an account</h2>
+        <p class="auth-desc">Get started with PDF Assistant</p>
+        <div id="signup-error" class="auth-error"></div>
+        <form id="signup-form">
+          <label>Full Name</label>
+          <input type="text" id="signup-name" placeholder="John Doe" required />
+          <label>Email</label>
+          <input type="email" id="signup-email" placeholder="you@example.com" required />
+          <label>Password</label>
+          <input type="password" id="signup-password" placeholder="Min 6 characters" required minlength="6" />
+          <button type="submit" class="btn-primary btn-full" id="signup-submit">Create Account</button>
+        </form>
+        <p class="auth-switch">Already have an account? <a href="#" id="switch-to-signin">Sign In</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════
+       App Page (shown when authenticated)
+       ═══════════════════════════════════════════════════════ -->
+  <div id="page-app" style="display:none">
+    <!-- Left Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <polyline points="10 9 9 9 8 9"/>
+          </svg>
+          <span>PDF Assistant</span>
+        </div>
+        <button id="btn-new-chat" title="New chat">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+      </div>
+
+      <div id="chat-list" class="chat-list"></div>
+
+      <!-- User footer -->
+      <div class="sidebar-footer">
+        <div class="user-info">
+          <div class="user-avatar" id="user-avatar">U</div>
+          <div class="user-details">
+            <span class="user-name" id="sidebar-user-name">User</span>
+            <span class="user-email" id="sidebar-user-email">user@email.com</span>
+          </div>
+        </div>
+        <button id="btn-signout" class="signout-btn" title="Sign out">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main id="main">
+      <div class="bg-decor" aria-hidden="true">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+        <div class="orb orb-4"></div>
+      </div>
+
+      <!-- Welcome view -->
+      <div id="view-welcome" class="view active">
+        <div class="welcome-card radiant-wrapper">
+          <div class="radiant-border"></div>
+          <div class="welcome-icon">
+            <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="url(#grad)" stroke-width="1.2">
+              <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#6366f1"/><stop offset="100%" stop-color="#8b5cf6"/>
+              </linearGradient></defs>
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <h1>Upload a PDF to get started</h1>
+          <p>Drop a PDF file here or click to browse. Ask questions about your document using AI.</p>
+          <div id="drop-zone" class="drop-zone">
+            <input type="file" id="file-input" accept=".pdf" hidden />
+            <div class="drop-zone-inner">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span>Choose PDF or drag &amp; drop</span>
+            </div>
+          </div>
+          <div id="upload-progress" class="upload-progress hidden">
+            <div class="spinner"></div>
+            <span>Processing PDF&hellip;</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chat view -->
+      <div id="view-chat" class="view">
+        <div id="chat-header" class="chat-header">
+          <div class="chat-header-info">
+            <h2 id="chat-title">Chat</h2>
+            <span id="chat-pdf-name" class="pdf-badge"></span>
+          </div>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div class="input-area">
+          <div class="radiant-wrapper radiant-input">
+            <div class="radiant-border"></div>
+            <div class="radiant-input-inner">
+              <button id="btn-attach" class="input-action-btn" title="Upload new PDF">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+              </button>
+              <input type="text" id="msg-input" placeholder="Ask a question about your PDF&hellip;" autocomplete="off" />
+              <button id="btn-send" class="is-empty" title="Send">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <input type="file" id="chat-file-input" accept=".pdf" hidden />
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
