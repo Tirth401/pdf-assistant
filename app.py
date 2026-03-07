@@ -273,7 +273,7 @@ async def chat(chat_id: str, request_body: ChatRequest, user: dict = Depends(get
         read_chat_history=True,
         add_references_to_prompt=True,
         markdown=True,
-        description=f"You are a helpful PDF assistant. You have access to the content of '{info['pdf_name']}'. Always use the document content to answer questions. If the user asks about the document, refer to the actual content from the knowledge base.",
+        description=f"You are a helpful PDF assistant. Today's date is {datetime.now().strftime('%B %d, %Y')}. You have access to the content of '{info['pdf_name']}'. Always use the document content to answer questions. If the user asks about the document, refer to the actual content from the knowledge base.",
     )
 
     def generate():
