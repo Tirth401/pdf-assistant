@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+uploads/
+chat_metadata.json
+users.json
+.venv/
+.git/
+*.md

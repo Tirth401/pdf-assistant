@@ -1,12 +1,8 @@
 phidata
 python-dotenv
-yfinance
 packaging
-duckduckgo-search
 fastapi
 uvicorn
-groq
-openai
 sqlalchemy
 pgvector
 psycopg[binary]
@@ -15,5 +11,4 @@ anthropic
 sentence-transformers
 python-multipart
 PyJWT
-passlib[bcrypt]
 bcrypt
