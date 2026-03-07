@@ -5,6 +5,8 @@ sys.stderr.reconfigure(encoding='utf-8')
 import os
 import json
 import uuid
+import logging
+import traceback
 import jwt as pyjwt
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -24,6 +26,9 @@ from phi.knowledge.pdf import PDFKnowledgeBase
 from phi.vectordb.pgvector import PgVector2
 from phi.llm.anthropic.claude import Claude
 from phi.embedder.sentence_transformer import SentenceTransformerEmbedder
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -123,6 +128,41 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ── Startup: ensure pgvector extension exists ────────────
+@app.on_event("startup")
+async def startup_event():
+    """Create the pgvector extension on the database if it doesn't exist."""
+    logger.info(f"DB_URL: {DB_URL[:30]}...")
+    try:
+        import psycopg
+        # Convert SQLAlchemy URL to plain psycopg URL
+        raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
+        with psycopg.connect(raw_url) as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+            logger.info("✅ pgvector extension ready")
+    except Exception as e:
+        logger.error(f"⚠️ Could not create pgvector extension: {e}")
+
+# ── Health check ─────────────────────────────────────────
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint to verify DB connection and config."""
+    checks = {"status": "ok", "db_url_set": bool(os.getenv("DATABASE_URL")), "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY"))}
+    try:
+        import psycopg
+        raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
+        with psycopg.connect(raw_url) as conn:
+            conn.execute("SELECT 1")
+            checks["db_connection"] = "ok"
+            # Check if vector extension exists
+            result = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'vector'").fetchone()
+            checks["pgvector"] = "installed" if result else "missing"
+    except Exception as e:
+        checks["db_connection"] = f"error: {str(e)}"
+        checks["status"] = "degraded"
+    return checks
+
 # ── Auth Routes ──────────────────────────────────────────
 
 class SignUpRequest(BaseModel):
@@ -186,39 +226,52 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(get_curr
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    chat_id = str(uuid.uuid4())
-    file_id = chat_id[:8]
-    safe_name = file.filename.replace(" ", "_")
-    filepath = UPLOAD_DIR / f"{file_id}_{safe_name}"
+    try:
+        chat_id = str(uuid.uuid4())
+        file_id = chat_id[:8]
+        safe_name = file.filename.replace(" ", "_")
+        filepath = UPLOAD_DIR / f"{file_id}_{safe_name}"
 
-    content = await file.read()
-    filepath.write_bytes(content)
+        content = await file.read()
+        filepath.write_bytes(content)
+        logger.info(f"Saved PDF: {filepath} ({len(content)} bytes)")
 
-    collection = f"pdf_{file_id}"
-    embedder = get_embedder()
-    kb = PDFKnowledgeBase(
-        path=str(filepath),
-        vector_db=PgVector2(collection=collection, db_url=DB_URL, embedder=embedder),
-    )
-    kb.load()
+        collection = f"pdf_{file_id}"
+        embedder = get_embedder()
+        logger.info(f"Creating knowledge base for collection: {collection}")
+        kb = PDFKnowledgeBase(
+            path=str(filepath),
+            vector_db=PgVector2(collection=collection, db_url=DB_URL, embedder=embedder),
+        )
+        logger.info("Loading knowledge base (embedding + storing)...")
+        kb.load()
+        logger.info("Knowledge base loaded successfully")
 
-    metadata = load_metadata()
-    metadata[chat_id] = {
-        "user_id": user["user_id"],
-        "pdf_name": file.filename,
-        "pdf_path": str(filepath),
-        "collection": collection,
-        "created_at": datetime.now().isoformat(),
-        "title": file.filename.rsplit(".", 1)[0],
-    }
-    save_metadata(metadata)
+        metadata = load_metadata()
+        metadata[chat_id] = {
+            "user_id": user["user_id"],
+            "pdf_name": file.filename,
+            "pdf_path": str(filepath),
+            "collection": collection,
+            "created_at": datetime.now().isoformat(),
+            "title": file.filename.rsplit(".", 1)[0],
+        }
+        save_metadata(metadata)
 
-    return {
-        "chat_id": chat_id,
-        "pdf_name": file.filename,
-        "title": metadata[chat_id]["title"],
-        "created_at": metadata[chat_id]["created_at"],
-    }
+        return {
+            "chat_id": chat_id,
+            "pdf_name": file.filename,
+            "title": metadata[chat_id]["title"],
+            "created_at": metadata[chat_id]["created_at"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload failed: {traceback.format_exc()}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Upload processing error: {str(e)}"},
+        )
 
 @app.get("/api/chats")
 async def list_chats(user: dict = Depends(get_current_user)):

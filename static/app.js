@@ -382,8 +382,10 @@ async function uploadPDF(file) {
   form.append("file", file);
   try {
     const res = await authFetch("/api/upload", { method: "POST", body: form });
-    if (!res.ok) { const e = await res.json(); throw new Error(e.detail || "Upload failed"); }
-    const data = await res.json();
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(text.slice(0, 200) || "Server error"); }
+    if (!res.ok) throw new Error(data.detail || "Upload failed");
     await fetchChats();
     openChat(data.chat_id);
   } catch (err) {
