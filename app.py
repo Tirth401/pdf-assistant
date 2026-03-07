@@ -26,16 +26,28 @@ from phi.llm.anthropic.claude import Claude
 from phi.embedder.sentence_transformer import SentenceTransformerEmbedder
 
 load_dotenv()
-os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY")
+
+# Set API key from env
+_api_key = os.getenv("ANTHROPIC_API_KEY")
+if _api_key:
+    os.environ["ANTHROPIC_API_KEY"] = _api_key
 
 # ── Config ────────────────────────────────────────────────
-DB_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
+# Railway provides DATABASE_URL as postgresql://... ; we need postgresql+psycopg://...
+_raw_db_url = os.getenv("DATABASE_URL", "postgresql+psycopg://ai:ai@localhost:5532/ai")
+if _raw_db_url.startswith("postgresql://"):
+    DB_URL = _raw_db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+elif _raw_db_url.startswith("postgres://"):
+    DB_URL = _raw_db_url.replace("postgres://", "postgresql+psycopg://", 1)
+else:
+    DB_URL = _raw_db_url
+
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 METADATA_FILE = Path("chat_metadata.json")
 USERS_FILE = Path("users.json")
 
-SECRET_KEY = "pdf-assistant-jwt-secret-2024-change-in-prod"
+SECRET_KEY = os.getenv("SECRET_KEY", "pdf-assistant-jwt-secret-2024-change-in-prod")
 ALGORITHM = "HS256"
 TOKEN_EXPIRY_DAYS = 30
 
@@ -320,4 +332,5 @@ async def rename_chat(chat_id: str, body: dict, user: dict = Depends(get_current
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8501)
+    port = int(os.getenv("PORT", "8501"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
