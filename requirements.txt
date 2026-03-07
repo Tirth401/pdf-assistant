@@ -6,6 +6,7 @@ uvicorn
 sqlalchemy
 pgvector
 psycopg[binary]
+psycopg2-binary
 pypdf
 anthropic
 sentence-transformers
