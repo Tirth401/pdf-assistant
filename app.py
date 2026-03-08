@@ -3,29 +3,29 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
+import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import anthropic
 import bcrypt as _bcrypt
+import fitz as pymupdf
 import jwt as pyjwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from phi.assistant import Assistant
-from phi.embedder.sentence_transformer import SentenceTransformerEmbedder
-from phi.knowledge.pdf import PDFKnowledgeBase
-from phi.llm.anthropic.claude import Claude
-from phi.storage.assistant.postgres import PgAssistantStorage
-from phi.vectordb.pgvector import PgVector2
+from pageindex import PageIndexClient
 from pydantic import BaseModel
-from sqlalchemy import Column, DateTime, String, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 logging.basicConfig(level=logging.INFO)
@@ -33,23 +33,23 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Set API key from env
-_api_key = os.getenv("ANTHROPIC_API_KEY")
-if _api_key:
-    os.environ["ANTHROPIC_API_KEY"] = _api_key
-
 # ── Config ────────────────────────────────────────────────
-_raw_db_url = os.getenv("DATABASE_URL", "postgresql+psycopg://ai:ai@localhost:5532/ai")
-if _raw_db_url.startswith("postgresql://"):
-    DB_URL = _raw_db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+PAGEINDEX_API_KEY = os.getenv("PAGEINDEX_API_KEY", "")
+
+VISION_PAGE_THRESHOLD = 15
+VISION_DPI = 150
+VISION_MODEL = "claude-sonnet-4-20250514"
+
+_raw_db_url = os.getenv("DATABASE_URL", "postgresql+psycopg2://ai:ai@localhost:5532/ai")
+if _raw_db_url.startswith("postgresql+psycopg://"):
+    DB_URL = _raw_db_url.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
 elif _raw_db_url.startswith("postgres://"):
-    DB_URL = _raw_db_url.replace("postgres://", "postgresql+psycopg://", 1)
+    DB_URL = _raw_db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+elif _raw_db_url.startswith("postgresql://") and "+psycopg2" not in _raw_db_url:
+    DB_URL = _raw_db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 else:
     DB_URL = _raw_db_url
-
-# SQLAlchemy needs postgresql+psycopg2:// for psycopg2 or postgresql+psycopg:// for psycopg3
-# We'll use psycopg2 for SQLAlchemy ORM tables since it's more widely compatible
-_sa_db_url = DB_URL.replace("postgresql+psycopg://", "postgresql://", 1)
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -58,7 +58,10 @@ SECRET_KEY = os.getenv("SECRET_KEY", "pdf-assistant-jwt-secret-2024-change-in-pr
 ALGORITHM = "HS256"
 TOKEN_EXPIRY_DAYS = 30
 
-# ── SQLAlchemy setup for users & chat metadata ────────────
+MAX_POLL_SECONDS = 180
+POLL_INTERVAL = 2
+
+# ── SQLAlchemy setup ──────────────────────────────────────
 Base = declarative_base()
 
 
@@ -72,17 +75,28 @@ class UserRow(Base):
 
 
 class ChatMetadataRow(Base):
-    __tablename__ = "chat_metadata"
+    __tablename__ = "chat_metadata_v2"
     chat_id = Column(String, primary_key=True)
     user_id = Column(String, nullable=False, index=True)
     pdf_name = Column(String, nullable=False)
     pdf_path = Column(String, nullable=False)
-    collection = Column(String, nullable=False)
+    mode = Column(String, nullable=False, default="vision")
+    doc_id = Column(String, nullable=True)
+    page_count = Column(Integer, nullable=False, default=1)
     title = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-_engine = create_engine(_sa_db_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+class ChatMessageRow(Base):
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(String, nullable=False, index=True)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+_engine = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 SessionLocal = sessionmaker(bind=_engine)
 
 
@@ -94,19 +108,59 @@ def verify_password(password: str, hashed: str) -> bool:
     return _bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
 
 
-# ── Singleton embedder ────────────────────────────────────
-_embedder = None
+# ── API clients ───────────────────────────────────────────
+_pi_client = None
+_anthropic_client = None
 
 
-def get_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformerEmbedder(dimensions=384)
-    return _embedder
+def get_pi_client() -> PageIndexClient:
+    global _pi_client
+    if _pi_client is None:
+        if not PAGEINDEX_API_KEY:
+            raise HTTPException(status_code=500, detail="PAGEINDEX_API_KEY not configured")
+        _pi_client = PageIndexClient(api_key=PAGEINDEX_API_KEY)
+    return _pi_client
 
 
-def get_storage():
-    return PgAssistantStorage(table_name="pdf_assistant_web", db_url=DB_URL)
+def get_anthropic_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+# ── PDF → images helper ──────────────────────────────────
+def pdf_to_page_images(pdf_path: str, output_dir: Path, file_id: str, dpi: int = VISION_DPI) -> int:
+    """Convert each page of a PDF to a JPEG image. Returns page count."""
+    doc = pymupdf.open(pdf_path)
+    page_count = doc.page_count
+    for i in range(page_count):
+        pix = doc[i].get_pixmap(dpi=dpi, alpha=False)
+        img_bytes = pix.tobytes("jpeg")
+        img_path = output_dir / f"{file_id}_page_{i}.jpg"
+        img_path.write_bytes(img_bytes)
+    doc.close()
+    return page_count
+
+
+def load_page_images_b64(pdf_path: str, file_id: str, page_count: int) -> list[dict]:
+    """Load previously saved page images as base64-encoded content blocks."""
+    output_dir = Path(pdf_path).parent
+    blocks = []
+    for i in range(page_count):
+        img_path = output_dir / f"{file_id}_page_{i}.jpg"
+        if not img_path.exists():
+            continue
+        b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+        blocks.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            }
+        )
+    return blocks
 
 
 # ── DB-backed user helpers ────────────────────────────────
@@ -127,15 +181,17 @@ def db_create_user(user_id, name, email, password_hash):
         s.commit()
 
 
-# ── DB-backed metadata helpers ────────────────────────────
-def db_save_chat_meta(chat_id, user_id, pdf_name, pdf_path, collection, title):
+# ── DB-backed chat metadata helpers ───────────────────────
+def db_save_chat_meta(chat_id, user_id, pdf_name, pdf_path, mode, doc_id, page_count, title):
     with SessionLocal() as s:
         row = ChatMetadataRow(
             chat_id=chat_id,
             user_id=user_id,
             pdf_name=pdf_name,
             pdf_path=pdf_path,
-            collection=collection,
+            mode=mode,
+            doc_id=doc_id or "",
+            page_count=page_count,
             title=title,
             created_at=datetime.utcnow(),
         )
@@ -152,7 +208,9 @@ def db_get_chat_meta(chat_id):
                 "user_id": row.user_id,
                 "pdf_name": row.pdf_name,
                 "pdf_path": row.pdf_path,
-                "collection": row.collection,
+                "mode": row.mode,
+                "doc_id": row.doc_id,
+                "page_count": row.page_count,
                 "title": row.title,
                 "created_at": row.created_at.isoformat() if row.created_at else "",
             }
@@ -180,6 +238,7 @@ def db_list_chats(user_id):
 
 def db_delete_chat(chat_id):
     with SessionLocal() as s:
+        s.query(ChatMessageRow).filter(ChatMessageRow.chat_id == chat_id).delete()
         s.query(ChatMetadataRow).filter(ChatMetadataRow.chat_id == chat_id).delete()
         s.commit()
 
@@ -190,6 +249,31 @@ def db_rename_chat(chat_id, new_title):
         if row:
             row.title = new_title
             s.commit()
+
+
+# ── DB-backed message helpers ─────────────────────────────
+def db_save_message(chat_id, role, content):
+    with SessionLocal() as s:
+        msg = ChatMessageRow(
+            chat_id=chat_id,
+            role=role,
+            content=content,
+            created_at=datetime.utcnow(),
+        )
+        s.add(msg)
+        s.commit()
+
+
+def db_get_messages(chat_id, limit=50):
+    with SessionLocal() as s:
+        rows = (
+            s.query(ChatMessageRow)
+            .filter(ChatMessageRow.chat_id == chat_id)
+            .order_by(ChatMessageRow.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        return [{"role": r.role, "content": r.content} for r in rows]
 
 
 # ── Auth helpers ──────────────────────────────────────────
@@ -231,26 +315,12 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-# ── Startup: create tables + pgvector extension ──────────
 @app.on_event("startup")
 async def startup_event():
-    logger.info(f"DB_URL (phi): {DB_URL[:40]}...")
-    logger.info(f"DB_URL (sa):  {_sa_db_url[:40]}...")
-    try:
-        import psycopg
-
-        raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
-        with psycopg.connect(raw_url, connect_timeout=10) as conn:
-            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            conn.commit()
-            logger.info("pgvector extension ready")
-    except Exception as e:
-        logger.error(f"Could not create pgvector extension: {e}")
-
-    # Create app tables (users, chat_metadata)
+    logger.info(f"DB_URL: {DB_URL[:40]}...")
     try:
         Base.metadata.create_all(_engine)
-        logger.info("App tables (app_users, chat_metadata) ready")
+        logger.info("App tables ready")
     except Exception as e:
         logger.error(f"Could not create app tables: {e}")
 
@@ -261,18 +331,20 @@ async def health_check():
     checks = {
         "status": "ok",
         "db_url_set": bool(os.getenv("DATABASE_URL")),
-        "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "db_url_preview": DB_URL[:50] + "...",
+        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
+        "pageindex_key_set": bool(PAGEINDEX_API_KEY),
+        "vision_threshold": VISION_PAGE_THRESHOLD,
     }
     try:
-        import psycopg
+        import psycopg2
 
-        raw_url = DB_URL.replace("postgresql+psycopg://", "postgresql://")
-        with psycopg.connect(raw_url, connect_timeout=5) as conn:
-            conn.execute("SELECT 1")
-            checks["db_connection"] = "ok"
-            result = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'vector'").fetchone()
-            checks["pgvector"] = "installed" if result else "missing"
+        raw_url = DB_URL.replace("postgresql+psycopg2://", "postgresql://")
+        conn = psycopg2.connect(raw_url, connect_timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        checks["db_connection"] = "ok"
     except Exception as e:
         checks["db_connection"] = f"error: {str(e)}"
         checks["status"] = "degraded"
@@ -352,24 +424,52 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(get_curr
         filepath.write_bytes(content)
         logger.info(f"Saved PDF: {filepath} ({len(content)} bytes)")
 
-        collection = f"pdf_{file_id}"
-        embedder = get_embedder()
-        logger.info(f"Creating knowledge base for collection: {collection}")
-        kb = PDFKnowledgeBase(
-            path=str(filepath),
-            vector_db=PgVector2(collection=collection, db_url=DB_URL, embedder=embedder),
-        )
-        logger.info("Loading knowledge base (embedding + storing)...")
-        kb.load()
-        logger.info("Knowledge base loaded successfully")
+        doc = pymupdf.open(str(filepath))
+        page_count = doc.page_count
+        doc.close()
+        logger.info(f"PDF has {page_count} pages")
+
+        if page_count <= VISION_PAGE_THRESHOLD:
+            mode = "vision"
+            logger.info(f"Using VISION path ({page_count} pages <= {VISION_PAGE_THRESHOLD})")
+            actual_pages = await asyncio.to_thread(pdf_to_page_images, str(filepath), UPLOAD_DIR, file_id)
+            logger.info(f"Converted {actual_pages} pages to images")
+            doc_id = ""
+        else:
+            mode = "pageindex"
+            logger.info(f"Using PAGEINDEX path ({page_count} pages > {VISION_PAGE_THRESHOLD})")
+            pi_client = get_pi_client()
+            result = pi_client.submit_document(str(filepath))
+            doc_id = result["doc_id"]
+            logger.info(f"Document submitted, doc_id: {doc_id}")
+
+            elapsed = 0
+            while elapsed < MAX_POLL_SECONDS:
+                doc_info = pi_client.get_document(doc_id)
+                status = doc_info.get("status", "unknown")
+                logger.info(f"Document status: {status} (elapsed: {elapsed}s)")
+                if status == "completed":
+                    break
+                if status == "failed":
+                    raise HTTPException(status_code=500, detail="PageIndex document processing failed")
+                await asyncio.sleep(POLL_INTERVAL)
+                elapsed += POLL_INTERVAL
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Document processing timed out after {MAX_POLL_SECONDS}s",
+                )
+            logger.info("Document processed by PageIndex successfully")
 
         title = file.filename.rsplit(".", 1)[0]
-        db_save_chat_meta(chat_id, user["user_id"], file.filename, str(filepath), collection, title)
+        db_save_chat_meta(chat_id, user["user_id"], file.filename, str(filepath), mode, doc_id, page_count, title)
 
         return {
             "chat_id": chat_id,
             "pdf_name": file.filename,
             "title": title,
+            "mode": mode,
+            "page_count": page_count,
             "created_at": datetime.utcnow().isoformat(),
         }
     except HTTPException:
@@ -393,16 +493,107 @@ async def get_messages(chat_id: str, user: dict = Depends(get_current_user)):
     if meta["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    storage = get_storage()
-    rows = storage.get_all_runs(user_id=user["user_id"])
-    for row in rows:
-        if row.run_id == chat_id and row.memory and "chat_history" in row.memory:
-            messages = []
-            for msg in row.memory["chat_history"]:
-                if msg.get("role") in ("user", "assistant") and msg.get("content"):
-                    messages.append({"role": msg["role"], "content": msg["content"]})
-            return {"messages": messages}
-    return {"messages": []}
+    messages = db_get_messages(chat_id)
+    return {"messages": messages}
+
+
+# ── Vision chat: stream via Anthropic SDK ─────────────────
+def _vision_generate(chat_id: str, meta: dict, user_message: str, history: list):
+    file_id = meta["chat_id"][:8]
+    image_blocks = load_page_images_b64(meta["pdf_path"], file_id, meta["page_count"])
+
+    if not image_blocks:
+        yield f"data: {json.dumps({'error': 'Could not load PDF page images'})}\n\n"
+        return
+
+    system_prompt = (
+        f"You are a helpful PDF assistant. The user has uploaded '{meta['pdf_name']}' "
+        f"({meta['page_count']} pages). The page images are provided below. "
+        "Answer questions based ONLY on what you can see in these pages. "
+        "Be precise with names, dates, numbers, and spelling — read them exactly as shown. "
+        "If something is unclear in the image, say so rather than guessing."
+    )
+
+    messages = []
+    for m in history:
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    user_content = list(image_blocks)
+    user_content.append({"type": "text", "text": user_message})
+    messages.append({"role": "user", "content": user_content})
+
+    client = get_anthropic_client()
+    full_response = ""
+    try:
+        with client.messages.stream(
+            model=VISION_MODEL,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+        ) as stream:
+            for text in stream.text_stream:
+                full_response += text
+                yield f"data: {json.dumps({'content': text})}\n\n"
+
+        db_save_message(chat_id, "assistant", full_response)
+        yield f"data: {json.dumps({'done': True})}\n\n"
+    except Exception as e:
+        logger.error(f"Vision chat error: {traceback.format_exc()}")
+        if full_response:
+            db_save_message(chat_id, "assistant", full_response)
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
+# ── PageIndex metadata filter ─────────────────────────────
+_PI_META_RE = re.compile(r'\{[^{}]*"doc_name"\s*:\s*"[^"]*"[^{}]*\}')
+
+
+def _filter_pageindex_stream(raw_chunks):
+    """Strip inline retrieval metadata from PageIndex streaming chunks."""
+    buf = ""
+    for chunk in raw_chunks:
+        buf += chunk
+        open_idx = buf.rfind("{")
+        if open_idx != -1 and "}" not in buf[open_idx:]:
+            safe = buf[:open_idx]
+            if safe:
+                yield _PI_META_RE.sub("", safe)
+            buf = buf[open_idx:]
+            continue
+        cleaned = _PI_META_RE.sub("", buf)
+        if cleaned:
+            yield cleaned
+        buf = ""
+    if buf:
+        cleaned = _PI_META_RE.sub("", buf)
+        if cleaned:
+            yield cleaned
+
+
+# ── PageIndex chat: stream via PageIndex SDK ──────────────
+def _pageindex_generate(chat_id: str, meta: dict, user_message: str, history: list):
+    pi_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    pi_messages.append({"role": "user", "content": user_message})
+
+    pi_client = get_pi_client()
+    full_response = ""
+    try:
+        raw_stream = pi_client.chat_completions(
+            messages=pi_messages,
+            doc_id=meta["doc_id"],
+            stream=True,
+        )
+        for chunk in _filter_pageindex_stream(raw_stream):
+            full_response += chunk
+            yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+        db_save_message(chat_id, "assistant", full_response)
+        yield f"data: {json.dumps({'done': True})}\n\n"
+    except Exception as e:
+        logger.error(f"PageIndex chat error: {traceback.format_exc()}")
+        if full_response:
+            db_save_message(chat_id, "assistant", full_response)
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 
 @app.post("/api/chat/{chat_id}")
@@ -413,36 +604,15 @@ async def chat(chat_id: str, request_body: ChatRequest, user: dict = Depends(get
     if meta["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    embedder = get_embedder()
-    kb = PDFKnowledgeBase(
-        path=meta["pdf_path"],
-        vector_db=PgVector2(collection=meta["collection"], db_url=DB_URL, embedder=embedder),
-    )
+    history = db_get_messages(chat_id)
+    db_save_message(chat_id, "user", request_body.message)
 
-    storage = get_storage()
-    assistant = Assistant(
-        run_id=chat_id,
-        user_id=user["user_id"],
-        llm=Claude(model="claude-sonnet-4-20250514"),
-        knowledge_base=kb,
-        storage=storage,
-        show_tool_calls=False,
-        search_knowledge=True,
-        read_chat_history=True,
-        add_references_to_prompt=True,
-        markdown=True,
-        description=f"You are a helpful PDF assistant. Today's date is {datetime.now().strftime('%B %d, %Y')}. You have access to the content of '{meta['pdf_name']}'. Always use the document content to answer questions. If the user asks about the document, refer to the actual content from the knowledge base.",
-    )
+    if meta["mode"] == "vision":
+        gen = _vision_generate(chat_id, meta, request_body.message, history)
+    else:
+        gen = _pageindex_generate(chat_id, meta, request_body.message, history)
 
-    def generate():
-        try:
-            for chunk in assistant.run(request_body.message, stream=True):
-                yield f"data: {json.dumps({'content': chunk})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(gen, media_type="text/event-stream")
 
 
 @app.delete("/api/chats/{chat_id}")
@@ -452,6 +622,19 @@ async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Chat not found")
     if meta["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    if meta["mode"] == "pageindex" and meta.get("doc_id"):
+        try:
+            pi_client = get_pi_client()
+            pi_client.delete_document(meta["doc_id"])
+        except Exception:
+            logger.warning(f"Could not delete PageIndex doc {meta['doc_id']}")
+
+    file_id = meta["chat_id"][:8]
+    for i in range(meta.get("page_count", 0)):
+        img = UPLOAD_DIR / f"{file_id}_page_{i}.jpg"
+        if img.exists():
+            img.unlink()
 
     pdf_path = Path(meta["pdf_path"])
     if pdf_path.exists():
